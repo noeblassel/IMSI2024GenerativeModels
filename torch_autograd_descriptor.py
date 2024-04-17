@@ -1,11 +1,18 @@
 import torch
+import torch.nn as nn
+
 import numpy as np
 
 from lammps import lammps
 from os.path import join
+from os import listdir
+import re
 from ase.io import read,write
 
-data_dir = 'data/transition_data_pt/'
+from torch.utils.data import Dataset,DataLoader
+
+
+data_dir = "data/transition_data_pt/"
 
 def init_commands(s1,s2,i):
     return f"""
@@ -23,8 +30,6 @@ def init_commands(s1,s2,i):
 
     compute D all sna/atom 4.7 0.99363 8 0.5 1
     compute dD all snad/atom 4.7 0.99363 8 0.5 1
-
-    # compute B all pace 
 
     run 0
 """
@@ -44,7 +49,7 @@ class LammpsComputeSNAP():
 
     def get_D(self):
         return np.ctypeslib.as_array(
-            self.L.gather("c_D",1,self.N_D)).reshape((-1,self.N_D)).sum(0) # gradients wrt descriptor summed over atoms
+            self.L.gather("c_D",1,self.N_D)).reshape((-1,self.N_D)).sum(0) # gradients are wrt descriptor summed over atoms
 
     def get_dD(self):
         """ snad/atom returns negative gradient! -- w.r.t. descriptor summed over atoms"""
@@ -84,30 +89,68 @@ def read_ase(filename):
         Z_of_type={1: 78}, 
         style="atomic")
 
-atom_ini = read_ase(join(data_dir,"1_2_0.dat"))
-atom_fin = read_ase(join(data_dir,"1_2_1.dat"))
+class PtNanoparticleDataset(Dataset):
+    def __init__(self,data_path):
+        self.data_path = data_path
+        self.files = listdir(self.data_path)
+        self.transitions = []
 
-X = torch.tensor(atom_ini.positions,requires_grad=True)
-X_f = torch.tensor(atom_fin.positions,requires_grad=False)
+        for f in self.files:
+            m = re.match('(\d+)_(\d+)_([01])\.dat',f)
+            if m is not None:
+                state_ini, state_fin, is_final = map(int, m.groups())
+                if is_final == 0:
+                    self.transitions.append((state_ini,state_fin,f,f"{state_ini}_{state_fin}_1.dat"))
+    
+    def __len__(self):
+        return len(self.transitions)
+    
+    def __getitem__(self,idx):
+        s1,s2,f1,f2 = self.transitions[idx]
+        conf_ini = read_ase(join(self.data_path,f1))
+        conf_fin = read_ase(join(self.data_path,f2))
 
-D_f = D_SNAP(X_f)
+        return torch.tensor(conf_ini.positions,requires_grad = True),torch.tensor(conf_fin.positions)
+    
+
+data_set = PtNanoparticleDataset(data_path='data/transition_data_pt/')
+data_loader = DataLoader(data_set,shuffle=True)
+
+
+global_steps = 100
+local_euler_steps = 100
 
 eta_euler = 1e-6
 eta_metric = 1e-6
 
-gloss_hist = []
-traj_hist = []
+A = torch.randn(55,10,requires_grad=True,dtype=torch.double)/55 # A@A.T parametrizes low-rank pseudometric
+A.retain_grad()
 
-rk = 10
-A = torch.randn(55,10,requires_grad=True,dtype=torch.double)/55 # low-rank pseudometric
+class MetricModel(nn.Module):
+    def __init__(self,rank,dim_features):
+        super().__init__()
+        self.A = torch.randn(dim_features,rank,dtype=torch.double) / torch.sqrt(dim_features*rank)
+
+for step in range(global_steps):
+    A.grad = None # reset A grad
+    X,X_f = next(iter(data_loader))
+
+    X = X.squeeze(0)
+    X_f = X_f.squeeze(0)
+
+    print(f"Step: {step}, initial distance: {torch.mean((X-X_f)**2)}")
+    D_f = D_SNAP(X_f)
+
+    gloss_hist = []
+    traj_hist = []
+
+    rk = 10
 
 
-for j in range(100):
-    A.grad = None
-    A.retain_grad()
     for k in range(100):
         traj_hist.append(X.detach().numpy())
         X.grad = None
+        X.retain_grad() # X is not a leaf node
         D = D_SNAP(X)
         loss = torch.mean(((D-D_f)@A)**2)
         loss.backward(retain_graph=True)
@@ -116,10 +159,11 @@ for j in range(100):
 
         with torch.no_grad():
             X -= eta_euler*X.grad
-    
-    glob_loss = torch.mean((X-X_f)**2)
+
+    glob_loss = torch.mean((X-X_f)**2) ## really here, we should be looking at RMSD
     glob_loss.backward()
     gloss_hist.append(glob_loss.item())
-    print(gloss_hist[-1])
+    print(f"Step: {step}, final distance: {gloss_hist[-1]}")
+
     with torch.no_grad():
         A -= eta_metric*A.grad
