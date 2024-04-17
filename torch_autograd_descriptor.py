@@ -44,10 +44,10 @@ class LammpsComputeSNAP():
 
     def get_D(self):
         return np.ctypeslib.as_array(
-            self.L.gather("c_D",1,self.N_D)).reshape((-1,self.N_D)).sum(0)
+            self.L.gather("c_D",1,self.N_D)).reshape((-1,self.N_D)).sum(0) # gradients wrt descriptor summed over atoms
 
     def get_dD(self):
-        """ snad/atom returns negative gradient -- w.r.t. descriptor summed over atoms !"""
+        """ snad/atom returns negative gradient! -- w.r.t. descriptor summed over atoms"""
         return -np.ctypeslib.as_array(
             self.L.gather("c_dD",1,3*self.N_D)).reshape((-1,3,self.N_D))
 
@@ -88,24 +88,38 @@ atom_ini = read_ase(join(data_dir,"1_2_0.dat"))
 atom_fin = read_ase(join(data_dir,"1_2_1.dat"))
 
 X = torch.tensor(atom_ini.positions,requires_grad=True)
-X_fin = torch.tensor(atom_fin.positions,requires_grad=False)
+X_f = torch.tensor(atom_fin.positions,requires_grad=False)
 
-D_f = D_SNAP(X_fin)
+D_f = D_SNAP(X_f)
 
-eta = 1e-6
-loss_hist = []
+eta_euler = 1e-6
+eta_metric = 1e-6
+
+gloss_hist = []
 traj_hist = []
 
-for k in range(1000):
-    traj_hist.append(X.detach().numpy())
-    X.grad = None
-    D = D_SNAP(X)
-    loss = torch.mean((D-D_f)**2)
-    loss.backward()
-    loss_hist.append(loss.item())
-    print(loss_hist[-1])
+rk = 10
+A = torch.randn(55,10,requires_grad=True,dtype=torch.double)/55 # low-rank pseudometric
 
+
+for j in range(100):
+    A.grad = None
+    A.retain_grad()
+    for k in range(100):
+        traj_hist.append(X.detach().numpy())
+        X.grad = None
+        D = D_SNAP(X)
+        loss = torch.mean(((D-D_f)@A)**2)
+        loss.backward(retain_graph=True)
+        if k%10 == 0:
+            print(f"Euler step {k}, loss {loss.item()}")
+
+        with torch.no_grad():
+            X -= eta_euler*X.grad
+    
+    glob_loss = torch.mean((X-X_f)**2)
+    glob_loss.backward()
+    gloss_hist.append(glob_loss.item())
+    print(gloss_hist[-1])
     with torch.no_grad():
-        X -= eta*X.grad
-
-
+        A -= eta_metric*A.grad
