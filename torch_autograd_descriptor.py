@@ -69,12 +69,15 @@ class LammpsComputeSNAP():
 _LMP = LammpsComputeSNAP()
 
 """
-Hack from https://github.com/pytorch/pytorch/issues/91810 to acess storage of grad-tracking tensors
+Hack adapted from https://github.com/pytorch/pytorch/issues/91810 to acess storage of grad-tracking tensors (including backward-calls of higher-order derivatives)
 """
 def detach_numpy(tensor):
     tensor = tensor.detach().cpu()
     if torch._C._functorch.is_gradtrackingtensor(tensor):
-        tensor = torch._C._functorch.get_unwrapped(tensor)
+        level = torch._C._functorch.maybe_get_level(tensor)
+        while level>=1:
+            tensor = torch._C._functorch.get_unwrapped(tensor)
+            level = torch._C._functorch.maybe_get_level(tensor)
         return np.array(tensor.storage().tolist()).reshape(tensor.shape)
     return tensor.numpy()
 
@@ -137,13 +140,13 @@ local_euler_steps = 100
 
 eta_euler = 5e-6
 eta_metric = 1e-3
-grad_tol = 1e-1
+grad_tol = 10
 
 def energy(x,a,D_f):
     return 0.5 * torch.sum(((D_SNAP(x)-D_f) @ a)**2)
 
 
-rk = 20
+rk = 10
 A = torch.randn(55,rk,dtype=torch.double)/np.sqrt(rk*55) # A@A.T parametrizes low-rank pseudometric
 
 def reconstruction_loss(x,y):
@@ -158,6 +161,13 @@ fin_loss_hist = []
 # print(torch.autograd.functional.jacobian(f,A).shape) # (N,3,N_d,rk)
 # jac_d = torch.func.jacrev(D_SNAP) # (N_D x N x 3)
 
+jac_a_grad_x_energy = torch.func.jacrev(grad_x_energy,1)
+
+X,X_f = next(iter(data_loader))
+X = X.squeeze(0)
+X_f = X_f.squeeze(0)
+D_f = D_SNAP(X_f)
+print(jac_a_grad_x_energy(X,A,D_f))
 
 for step in range(global_steps):
     X,X_f = next(iter(data_loader))
@@ -183,11 +193,11 @@ for step in range(global_steps):
         if k%50 == 0:
             print(f"\tEuler iteration {k}, loss: {e}, max abs gradient {g_linf}")
     
-    J = torch.autograd.functional.jacobian(lambda a: grad_x_energy(X,a,D_f),A) # (N,3,N_d,rk), probably a much more efficient method..
+    J = jac_a_grad_x_energy(X,A,D_f) # (N,3,N_d,rk), probably a much more efficient method..
 
     l_fin = reconstruction_loss(X,X_f)
-    print(f"Global iteration {step}, initial reconstruction loss: {l_fin}")
+    print(f"Global iteration {step}, final reconstruction loss: {l_fin}")
     fin_loss_hist.append(l_fin)
 
-    A -= eta_metric * torch.einsum('ij,ijkl->kl',J,grad_x_reconstruction_loss(X,X_f))
+    A -= eta_metric * torch.einsum('ijkl,ij->kl',J,grad_x_reconstruction_loss(X,X_f))
     torch.save(A,"weights_reconstruct.pt")
