@@ -9,6 +9,8 @@ from os import listdir
 import re
 from ase.io import read,write
 
+from functools import partial
+
 from torch.utils.data import Dataset,DataLoader
 
 
@@ -66,19 +68,32 @@ class LammpsComputeSNAP():
     
 _LMP = LammpsComputeSNAP()
 
+"""
+Hack from https://github.com/pytorch/pytorch/issues/91810 to acess storage of grad-tracking tensors
+"""
+def detach_numpy(tensor):
+    tensor = tensor.detach().cpu()
+    if torch._C._functorch.is_gradtrackingtensor(tensor):
+        tensor = torch._C._functorch.get_unwrapped(tensor)
+        return np.array(tensor.storage().tolist()).reshape(tensor.shape)
+    return tensor.numpy()
+
 class SNAPDescriptor(torch.autograd.Function):
     @staticmethod
-    def forward(ctx,X):
-        ctx.save_for_backward(X)
-        _LMP.set_X(X.numpy())
-        return torch.tensor(_LMP.get_D())
+    def forward(X):
+        _LMP.set_X(detach_numpy(X))
+        return torch.tensor(_LMP.get_D()) # for backward pass
 
     @staticmethod
-    def backward(ctx,grad_loss_D):
-        X, = ctx.saved_tensors
-        _LMP.set_X(X.numpy())
-        grad_D_X = torch.tensor(_LMP.get_dD())
-        return torch.einsum("ijk,k->ij",grad_D_X,grad_loss_D)
+    def setup_context(ctx, inputs, outputs):
+        X, = inputs
+        ctx.save_for_backward(X.detach())
+
+    @staticmethod
+    def backward(ctx,grad_f_d):
+        X,=ctx.saved_tensors
+        _LMP.set_X(detach_numpy(X))
+        return torch.einsum("ijk,k->ij",torch.tensor(_LMP.get_dD()),grad_f_d)
 
 D_SNAP = SNAPDescriptor.apply
 
@@ -110,7 +125,7 @@ class PtNanoparticleDataset(Dataset):
         conf_ini = read_ase(join(self.data_path,f1))
         conf_fin = read_ase(join(self.data_path,f2))
 
-        return torch.tensor(conf_ini.positions,requires_grad = True),torch.tensor(conf_fin.positions)
+        return torch.tensor(conf_ini.positions),torch.tensor(conf_fin.positions)
     
 
 data_set = PtNanoparticleDataset(data_path='data/transition_data_pt/')
@@ -120,50 +135,59 @@ data_loader = DataLoader(data_set,shuffle=True)
 global_steps = 100
 local_euler_steps = 100
 
-eta_euler = 1e-6
-eta_metric = 1e-6
+eta_euler = 5e-6
+eta_metric = 1e-3
+grad_tol = 1e-1
 
-A = torch.randn(55,10,requires_grad=True,dtype=torch.double)/55 # A@A.T parametrizes low-rank pseudometric
-A.retain_grad()
+def energy(x,a,D_f):
+    return 0.5 * torch.sum(((D_SNAP(x)-D_f) @ a)**2)
 
-class MetricModel(nn.Module):
-    def __init__(self,rank,dim_features):
-        super().__init__()
-        self.A = torch.randn(dim_features,rank,dtype=torch.double) / torch.sqrt(dim_features*rank)
+
+rk = 20
+A = torch.randn(55,rk,dtype=torch.double)/np.sqrt(rk*55) # A@A.T parametrizes low-rank pseudometric
+
+def reconstruction_loss(x,y):
+    return torch.mean((x-y)**2)
+
+grad_x_reconstruction_loss = torch.func.jacrev(reconstruction_loss,0) # (N,3)
+grad_x_energy = torch.func.grad(energy,0) # (N,3)
+
+ini_loss_hist = []
+fin_loss_hist = []
+
+# print(torch.autograd.functional.jacobian(f,A).shape) # (N,3,N_d,rk)
+# jac_d = torch.func.jacrev(D_SNAP) # (N_D x N x 3)
+
 
 for step in range(global_steps):
-    A.grad = None # reset A grad
     X,X_f = next(iter(data_loader))
-
     X = X.squeeze(0)
     X_f = X_f.squeeze(0)
-
-    print(f"Step: {step}, initial distance: {torch.mean((X-X_f)**2)}")
     D_f = D_SNAP(X_f)
 
-    gloss_hist = []
-    traj_hist = []
+    l_ini = reconstruction_loss(X,X_f)
+    print(f"Global iteration {step}, initial reconstruction loss: {l_ini}")
 
-    rk = 10
+    ini_loss_hist.append(l_ini)
+    k = 0
 
 
-    for k in range(100):
-        traj_hist.append(X.detach().numpy())
-        X.grad = None
-        X.retain_grad() # X is not a leaf node
-        D = D_SNAP(X)
-        loss = torch.mean(((D-D_f)@A)**2)
-        loss.backward(retain_graph=True)
-        if k%10 == 0:
-            print(f"Euler step {k}, loss {loss.item()}")
+    while True:
+        e = energy(X,A,D_f)
+        g = grad_x_energy(X,A,D_f)
+        g_linf = torch.abs(g).max()
+        if g_linf < grad_tol:
+            break
+        X -= eta_euler * g
+        k +=1 
+        if k%50 == 0:
+            print(f"\tEuler iteration {k}, loss: {e}, max abs gradient {g_linf}")
+    
+    J = torch.autograd.functional.jacobian(lambda a: grad_x_energy(X,a,D_f),A) # (N,3,N_d,rk), probably a much more efficient method..
 
-        with torch.no_grad():
-            X -= eta_euler*X.grad
+    l_fin = reconstruction_loss(X,X_f)
+    print(f"Global iteration {step}, initial reconstruction loss: {l_fin}")
+    fin_loss_hist.append(l_fin)
 
-    glob_loss = torch.mean((X-X_f)**2) ## really here, we should be looking at RMSD
-    glob_loss.backward()
-    gloss_hist.append(glob_loss.item())
-    print(f"Step: {step}, final distance: {gloss_hist[-1]}")
-
-    with torch.no_grad():
-        A -= eta_metric*A.grad
+    A -= eta_metric * torch.einsum('ij,ijkl->kl',J,grad_x_reconstruction_loss(X,X_f))
+    torch.save(A,"weights_reconstruct.pt")
